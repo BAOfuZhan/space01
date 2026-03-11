@@ -63,10 +63,10 @@
         ],
 
         "_comment_mode": "精准提交策略：A = 目标时间前 pre_fetch_token_ms 毫秒预取 token；B = 目标时间后 first_submit_offset_ms 毫秒取 token 并立即提交。",
-        "mode": "B",
+        "mode": "A",
 
         "_comment_submit_mode": "提交模式：serial = 串行重试（每枪等 HTTP 响应后再决定是否继续）；burst = 定时连发（按 burst_offsets_ms 时间表多线程同时发射，互不等待结果）。",
-        "submit_mode": "serial",
+        "submit_mode": "burst",
 
         "_comment_login_lead_seconds": "在目标时间前多少秒开始登录 + session 预热。",
         "login_lead_seconds": 14,

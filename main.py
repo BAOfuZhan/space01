@@ -65,7 +65,7 @@ ENDTIME = "20:00:40"  # 根据学校的预约座位时间+1min即可
 
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平台）
-MAX_ATTEMPT = 160  # 最大尝试次数（减少到30次，确保3个配置都能尝试）
+MAX_ATTEMPT = 1
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 
 
@@ -142,6 +142,7 @@ def strategic_first_attempt(
     action: bool,
     target_dt: datetime.datetime,
     success_list=None,
+    sessions=None,
 ):
     """只在第一次调用时使用的“有策略抢座”。
 
@@ -229,6 +230,9 @@ def strategic_first_attempt(
         s.get_login_status()
         s.login(username, password)
         s.requests.headers.update({"Host": "office.chaoxing.com"})
+        # 将已登录的 session 存入 sessions[]，fallback 直接复用，无需重新登录
+        if sessions is not None and sessions[index] is None:
+            sessions[index] = s
 
         first_seat = seat_list[0]
 
@@ -281,9 +285,10 @@ def strategic_first_attempt(
             captcha2 = get_textclick_with_retry("Second")
 
         # token URL 供所有 3 次提交复用
+        _reservation_day = _beijing_now().date() + datetime.timedelta(days=1 if RESERVE_NEXT_DAY else 0)
         _token_url = s.url.format(
             roomId=roomid,
-            day=str(_beijing_now().date()),
+            day=str(_reservation_day),
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
@@ -294,31 +299,29 @@ def strategic_first_attempt(
             captchas_list = [captcha1, captcha2, captcha3]
 
             if STRATEGIC_MODE == "A":
-                # 策略 A + burst：主线程在 T - PRE_FETCH_TOKEN_MS 提前串行取好 N 份 token，
-                # 线程到点直接 POST，零 GET 延迟
+                # 策略 A + burst：主线程在 T - PRE_FETCH_TOKEN_MS 提前取 1 份 token，
+                # 所有线程共用同一份，到点直接 POST，零 GET 延迟
                 burst_prefetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
                 if _beijing_now() < burst_prefetch_dt:
                     logging.info(
                         f"[strategic] [burst-A] Waiting until target_dt - {PRE_FETCH_TOKEN_MS}ms "
-                        f"({burst_prefetch_dt}) to pre-fetch tokens"
+                        f"({burst_prefetch_dt}) to pre-fetch token"
                     )
                     while _beijing_now() < burst_prefetch_dt:
                         time.sleep(0.05)
 
                 logging.info(
-                    f"[strategic] [burst-A] Pre-fetching {n_shots} tokens at {_beijing_now()}"
+                    f"[strategic] [burst-A] Pre-fetching 1 shared token at {_beijing_now()}"
                 )
-                pre_tokens = []
-                for i in range(n_shots):
-                    pt, pv = s._get_page_token(_token_url, require_value=True)
-                    if pt:
-                        logging.info(f"[strategic] [burst-A] Pre-fetched token {i + 1}: {pt}")
-                    else:
-                        logging.warning(
-                            f"[strategic] [burst-A] Token {i + 1} pre-fetch failed, "
-                            "thread will fetch on-the-fly as fallback"
-                        )
-                    pre_tokens.append((pt, pv))
+                pt, pv = s._get_page_token(_token_url, require_value=True)
+                if pt:
+                    logging.info(f"[strategic] [burst-A] Pre-fetched shared token: {pt}")
+                else:
+                    logging.warning(
+                        "[strategic] [burst-A] Token pre-fetch failed, "
+                        "threads will fetch on-the-fly as fallback"
+                    )
+                pre_tokens = [(pt, pv)] * n_shots
             else:
                 # 策略 B + burst：不预取，各线程在各自的发射时刻（T + offset）自己取 token 并立即提交
                 logging.info(
@@ -635,7 +638,7 @@ def main(users, action=False):
 
         if not strategic_done and action:
             success_list = strategic_first_attempt(
-                users, usernames, passwords, action, target_dt, success_list
+                users, usernames, passwords, action, target_dt, success_list, sessions
             )
             strategic_done = True
 
@@ -650,7 +653,12 @@ def main(users, action=False):
                             f"[seat-increment-after-strategic] Config {i}: try seat {new_seat} "
                             f"(base {original_seatids[i]} + offset {seat_offset})"
                         )
-                # 递增座位后立即调用 login_and_reserve
+                # 递增座位后立即调用 login_and_reserve（每个座位只试一次）
+                MAX_ATTEMPT = 1
+                if sessions is not None:
+                    for s_obj in sessions:
+                        if s_obj is not None:
+                            s_obj.max_attempt = 1
                 success_list = login_and_reserve(
                     users, usernames, passwords, action, success_list, sessions
                 )
