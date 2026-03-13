@@ -898,6 +898,154 @@ function normalizeReadingZoneGroups(raw) {
   return normalizedGroups;
 }
 
+function _emptySlot() {
+  return { roomid: "", seatid: "", times: "", seatPageId: "", fidEnc: "" };
+}
+
+function createEmptyWeeklySchedule() {
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+  const schedule = {};
+  for (const d of days) {
+    schedule[d] = { enabled: false, slots: [_emptySlot(), _emptySlot(), _emptySlot()] };
+  }
+  return schedule;
+}
+
+function parseScheduleJsonMapping(rawText) {
+  const parsed = JSON.parse(rawText);
+  const items = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" ? [parsed] : []);
+  if (!items.length) {
+    throw new Error("周计划 JSON 必须是对象或数组");
+  }
+
+  const schedule = createEmptyWeeklySchedule();
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+
+    const roomid = String(item.roomid || "").trim();
+    const seatPageId = String(item.seatPageId || item.roomid || "").trim();
+    const fidEnc = String(item.fidEnc || "").trim();
+
+    let times = item.times;
+    if (Array.isArray(times) && times.length >= 2) {
+      times = String(times[0]).trim() + "-" + String(times[1]).trim();
+    } else {
+      times = String(times || "").trim();
+    }
+
+    let seatid = item.seatid;
+    if (Array.isArray(seatid)) {
+      seatid = seatid.map(v => String(v).trim()).filter(Boolean).join(",");
+    } else {
+      seatid = String(seatid || "").trim();
+    }
+
+    const daysofweek = Array.isArray(item.daysofweek) ? item.daysofweek : [];
+    for (const day of daysofweek) {
+      if (!schedule[day]) continue;
+      schedule[day].enabled = true;
+      schedule[day].slots.push({ roomid, seatid, times, seatPageId, fidEnc });
+    }
+  }
+
+  for (const day of Object.keys(schedule)) {
+    const slots = (schedule[day].slots || []).filter(s => s && (s.roomid || s.times));
+    if (slots.length === 0) {
+      schedule[day].enabled = false;
+      schedule[day].slots = [_emptySlot(), _emptySlot(), _emptySlot()];
+      continue;
+    }
+    // UI 仍显示 3 行，超出部分不会在表单中展示，但后端可保存全部。
+    schedule[day].slots = slots;
+  }
+
+  return schedule;
+}
+
+function scheduleToJsonMapping(schedule) {
+  const result = [];
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+  for (const day of days) {
+    const dayCfg = schedule?.[day];
+    if (!dayCfg || !dayCfg.enabled) continue;
+    const slots = Array.isArray(dayCfg.slots)
+      ? dayCfg.slots
+      : [{ roomid: dayCfg.roomid, seatid: dayCfg.seatid, times: dayCfg.times, seatPageId: dayCfg.seatPageId, fidEnc: dayCfg.fidEnc }];
+    for (const s of slots) {
+      if (!s || !s.roomid || !s.times) continue;
+      let times = s.times;
+      if (typeof times === "string") {
+        const p = times.split(/-|~|至/).map(x => x.trim()).filter(Boolean);
+        times = p.length >= 2 ? [p[0], p[1]] : [times, ""];
+      }
+      const seatid = String(s.seatid || "").split(",").map(x => x.trim()).filter(Boolean);
+      result.push({
+        times,
+        roomid: String(s.roomid || ""),
+        seatid,
+        seatPageId: String(s.seatPageId || s.roomid || ""),
+        fidEnc: String(s.fidEnc || ""),
+        daysofweek: [day],
+      });
+    }
+  }
+  return result;
+}
+
+function fillScheduleFormFromSchedule(schedule) {
+  const days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+  days.forEach(d => {
+    const sch = schedule?.[d] || {};
+    document.getElementById("sch_" + d + "_enabled").checked = !!sch.enabled;
+    const slots = sch.slots || [{ roomid: sch.roomid, seatid: sch.seatid, times: sch.times, seatPageId: sch.seatPageId, fidEnc: sch.fidEnc }];
+    const visibleCount = Math.max(1, Math.min(3, slots.filter(Boolean).length || 1));
+    setVisibleSlotsForDay(d, visibleCount);
+    [0,1,2].forEach(i => {
+      const s = slots[i] || {};
+      document.getElementById("sch_" + d + "_s" + i + "_roomid").value = s.roomid || "";
+      document.getElementById("sch_" + d + "_s" + i + "_seatid").value = s.seatid || "";
+      document.getElementById("sch_" + d + "_s" + i + "_times").value = s.times || "";
+      document.getElementById("sch_" + d + "_s" + i + "_seatPageId").value = s.seatPageId || "";
+      document.getElementById("sch_" + d + "_s" + i + "_fidEnc").value = s.fidEnc || "";
+    });
+  });
+}
+
+function setVisibleSlotsForDay(day, count) {
+  const visibleCount = Math.max(1, Math.min(3, parseInt(count, 10) || 1));
+  [0,1,2].forEach(i => {
+    const row = document.getElementById("sch_" + day + "_row_" + i);
+    if (!row) return;
+    row.style.display = i < visibleCount ? "" : "none";
+  });
+}
+
+function getVisibleSlotsForDay(day) {
+  let count = 0;
+  [0,1,2].forEach(i => {
+    const row = document.getElementById("sch_" + day + "_row_" + i);
+    if (row && row.style.display !== "none") count++;
+  });
+  return Math.max(1, count);
+}
+
+function addSlotForDay(day) {
+  const current = getVisibleSlotsForDay(day);
+  setVisibleSlotsForDay(day, current + 1);
+}
+
+function applyScheduleJsonToForm() {
+  const scheduleJsonText = (document.getElementById("edit_user_schedule_json").value || "").trim();
+  if (!scheduleJsonText) return toast("请先粘贴周计划 JSON", "error");
+  try {
+    const schedule = parseScheduleJsonMapping(scheduleJsonText);
+    fillScheduleFormFromSchedule(schedule);
+    toast("已映射到周计划配置");
+  } catch (e) {
+    toast("周计划 JSON 解析失败: " + (e.message || String(e)), "error");
+  }
+}
+
 async function api(method, path, body = null) {
   const opts = {
     method,
@@ -1329,7 +1477,7 @@ function renderUserModal() {
                   <label>\${dayNames[d]}</label>
                 </div>
                 \${[0,1,2].map(i => \`
-                  <div class="slot-row">
+                  <div class="slot-row" id="sch_\${d}_row_\${i}" style="\${i > 0 ? 'display:none;' : ''}">
                     <div class="slot-label">时段\${i+1}</div>
                     <div class="schedule-day-fields">
                       <input type="text" id="sch_\${d}_s\${i}_roomid" placeholder="房间ID">
@@ -1343,8 +1491,14 @@ function renderUserModal() {
                     </div>
                   </div>
                 \`).join("")}
+                <button type="button" class="btn btn-sm btn-secondary" onclick="addSlotForDay('\${d}')">+ 添加时段</button>
               </div>
             \`).join("")}
+          </div>
+          <div class="form-group" style="margin-top:12px">
+            <label>周计划 JSON 映射（单一输入框）</label>
+            <textarea id="edit_user_schedule_json" rows="8" placeholder='示例: [{"times":["09:00","23:00"],"roomid":"13484","seatid":["356"],"seatPageId":"13484","fidEnc":"4a18e12602b24c8c","daysofweek":["Monday","Tuesday"]}]'></textarea>
+            <button type="button" class="btn btn-secondary" onclick="applyScheduleJsonToForm()" style="margin-top:8px">映射到周计划配置</button>
           </div>
           <button class="btn btn-primary" onclick="doSaveUser()" style="width:100%;margin-top:16px">保存用户</button>
         </div>
@@ -1528,6 +1682,7 @@ function showAddUser() {
   const days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
   days.forEach(d => {
     document.getElementById("sch_" + d + "_enabled").checked = false;
+    setVisibleSlotsForDay(d, 1);
     [0,1,2].forEach(i => {
       document.getElementById("sch_" + d + "_s" + i + "_roomid").value = "";
       document.getElementById("sch_" + d + "_s" + i + "_seatid").value = "";
@@ -1536,6 +1691,7 @@ function showAddUser() {
       document.getElementById("sch_" + d + "_s" + i + "_fidEnc").value = "";
     });
   });
+  document.getElementById("edit_user_schedule_json").value = "";
   document.getElementById("userModal").classList.add("show");
 }
 
@@ -1549,21 +1705,8 @@ async function showEditUser(userId) {
   document.getElementById("edit_user_username").value = u.username || "";
   document.getElementById("edit_user_password").value = "";
   document.getElementById("edit_user_remark").value = u.remark || "";
-  const days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
-  days.forEach(d => {
-    const sch = u.schedule[d] || {};
-    document.getElementById("sch_" + d + "_enabled").checked = sch.enabled || false;
-    // 兼容旧数据（flat）和新数据（slots）
-    const slots = sch.slots || [{ roomid: sch.roomid, seatid: sch.seatid, times: sch.times, seatPageId: sch.seatPageId, fidEnc: sch.fidEnc }];
-    [0,1,2].forEach(i => {
-      const s = slots[i] || {};
-      document.getElementById("sch_" + d + "_s" + i + "_roomid").value = s.roomid || "";
-      document.getElementById("sch_" + d + "_s" + i + "_seatid").value = s.seatid || "";
-      document.getElementById("sch_" + d + "_s" + i + "_times").value = s.times || "";
-      document.getElementById("sch_" + d + "_s" + i + "_seatPageId").value = s.seatPageId || "";
-      document.getElementById("sch_" + d + "_s" + i + "_fidEnc").value = s.fidEnc || "";
-    });
-  });
+  fillScheduleFormFromSchedule(u.schedule || {});
+  document.getElementById("edit_user_schedule_json").value = JSON.stringify(scheduleToJsonMapping(u.schedule || {}), null, 2);
   document.getElementById("userModal").classList.add("show");
 }
 
@@ -1575,9 +1718,22 @@ async function doSaveUser() {
   const remark = document.getElementById("edit_user_remark").value.trim();
   if (!phone) return toast("请填写手机号（登录账号）", "error");
   const days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+  const scheduleJsonText = (document.getElementById("edit_user_schedule_json").value || "").trim();
+  // JSON 映射仅作为“快速填充表单”，最终提交始终以表单中的周计划配置为准。
+  if (scheduleJsonText) {
+    try {
+      const mappedSchedule = parseScheduleJsonMapping(scheduleJsonText);
+      fillScheduleFormFromSchedule(mappedSchedule);
+    } catch (e) {
+      return toast("周计划 JSON 解析失败: " + (e.message || String(e)), "error");
+    }
+  }
+
   const schedule = {};
   days.forEach(d => {
-    const slots = [0,1,2].map(i => ({
+    const visibleCount = getVisibleSlotsForDay(d);
+    const slotIndexes = Array.from({ length: visibleCount }, (_, i) => i);
+    const slots = slotIndexes.map(i => ({
       roomid: document.getElementById("sch_" + d + "_s" + i + "_roomid").value.trim(),
       seatid: document.getElementById("sch_" + d + "_s" + i + "_seatid").value.trim(),
       times: document.getElementById("sch_" + d + "_s" + i + "_times").value.trim(),
@@ -1589,6 +1745,7 @@ async function doSaveUser() {
       slots,
     };
   });
+
   const body = { phone, username, remark, schedule };
   if (password) body.password = password;
   let res;
