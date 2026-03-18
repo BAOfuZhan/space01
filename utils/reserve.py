@@ -101,11 +101,8 @@ class reserve:
         )
         self.request_attempts = max(1, int(os.getenv("CX_REQUEST_ATTEMPTS", "3")))
         self.request_retry_delay = float(os.getenv("CX_REQUEST_RETRY_DELAY", "0.2"))
-        self.token_fetch_attempts = max(
-            1, int(os.getenv("CX_TOKEN_FETCH_ATTEMPTS", "8"))
-        )
         self.token_fetch_retry_delay = float(
-            os.getenv("CX_TOKEN_FETCH_RETRY_DELAY", "0.08")
+            os.getenv("CX_TOKEN_FETCH_RETRY_DELAY", "0.005")
         )
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
@@ -145,20 +142,22 @@ class reserve:
         return "已有预约" in msg or "已被占用" in msg
 
     @staticmethod
-    def _is_token_page_not_open(response_url: str = "", html: str = "") -> bool:
+    def _get_token_page_msg(response_url: str = "") -> str:
         parsed = urlparse(str(response_url or ""))
-        if parsed.path == "/front/apps/reserve/error/code/500":
-            msg_values = parse_qs(parsed.query).get("msg", [])
-            for value in msg_values:
-                decoded = unquote(str(value or ""))
-                if "当前区域未到开放预约时间" in decoded:
-                    return True
+        msg_values = parse_qs(parsed.query).get("msg", [])
+        for value in msg_values:
+            decoded = unquote(str(value or ""))
+            if decoded:
+                return decoded
+        return ""
 
-        text = html if isinstance(html, str) else ""
+    @classmethod
+    def _is_token_page_not_open(cls, response_url: str = "") -> bool:
+        raw_url = str(response_url or "")
+        msg = cls._get_token_page_msg(raw_url)
         return (
-            "当前区域未到开放预约时间" in text
-            or "请咨询管理员确认该区域开放时间" in text
-            or "未到开放预约时间" in text
+            "当前区域未到开放预约时间" in msg
+            or "msg=%E5%BD%93%E5%89%8D%E5%8C%BA%E5%9F%9F%E6%9C%AA%E5%88%B0%E5%BC%80%E6%94%BE%E9%A2%84%E7%BA%A6%E6%97%B6%E9%97%B4" in raw_url
         )
 
     def should_skip_followup_submit(self) -> bool:
@@ -234,13 +233,14 @@ class reserve:
             not_open_retry_interval: “未到开放时间”重试间隔（秒）
         """
         last_html = ""
-        attempts = max(1, self.token_fetch_attempts)
         attempt = 0
         not_open_retry_interval = (
             float(not_open_retry_interval)
             if not_open_retry_interval is not None
             else self.token_fetch_retry_delay
         )
+
+        last_response_url = ""
 
         while True:
             attempt += 1
@@ -263,26 +263,7 @@ class reserve:
                 return "", ""
 
             final_url = getattr(response, "url", "")
-            not_open_yet = self._is_token_page_not_open(response_url=final_url)
-            if not_open_yet and not_open_retry_until is not None:
-                now = (
-                    datetime.datetime.now(not_open_retry_until.tzinfo)
-                    if getattr(not_open_retry_until, "tzinfo", None)
-                    else datetime.datetime.now()
-                )
-                if now < not_open_retry_until:
-                    remaining_s = max(
-                        0.0, (not_open_retry_until - now).total_seconds()
-                    )
-                    sleep_s = min(not_open_retry_interval, remaining_s)
-                    logging.warning(
-                        f"Get page token from {url} redirected to not-open page on retry "
-                        f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                        f"(sleep {sleep_s:.3f}s)"
-                    )
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
-                    continue
+            last_response_url = final_url
 
             # 统一按 UTF-8 解码，并忽略非法字符，避免 charset 识别错误导致正则匹配失败
             html = response.content.decode("utf-8", errors="ignore")
@@ -305,10 +286,8 @@ class reserve:
                     )
                 return token, algorithm_value
 
-            not_open_yet = self._is_token_page_not_open(
-                response_url=final_url,
-                html=html,
-            )
+            not_open_yet = self._is_token_page_not_open(response_url=final_url)
+            page_msg = self._get_token_page_msg(final_url)
             if not_open_retry_until is not None:
                 now = (
                     datetime.datetime.now(not_open_retry_until.tzinfo)
@@ -324,7 +303,7 @@ class reserve:
                         logging.warning(
                             f"Get page token from {url} hit not-open-yet page on retry "
                             f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                            f"(sleep {sleep_s:.3f}s)"
+                            f"(sleep {sleep_s:.3f}s, msg={page_msg})"
                         )
                     else:
                         logging.warning(
@@ -335,25 +314,18 @@ class reserve:
                     if sleep_s > 0:
                         time.sleep(sleep_s)
                     continue
-
-            if attempt < attempts:
-                if not_open_yet:
-                    logging.warning(
-                        f"Get page token from {url} hit not-open-yet page on fast retry "
-                        f"{attempt}/{attempts}; retry in {self.token_fetch_retry_delay:.3f}s"
-                    )
-                else:
-                    logging.warning(
-                        f"Get page token from {url} returned no submit_enc on fast retry "
-                        f"{attempt}/{attempts}; retry in {self.token_fetch_retry_delay:.3f}s"
-                    )
-                time.sleep(self.token_fetch_retry_delay)
+                logging.warning(
+                    f"Get page token from {url} stop refreshing after retry {attempt}: "
+                    f"reached retry deadline {not_open_retry_until}"
+                )
+                break
+            break
 
         # 取不到 token 时：
         # 1. 控制台打印部分页面内容
         # 2. 将完整 HTML 保存到 html_debug 目录，方便你用浏览器打开对比前端结构
         snippet = last_html[:500].replace("\n", " ")
-        if self._is_token_page_not_open(html=last_html):
+        if self._is_token_page_not_open(response_url=last_response_url):
             logging.error(
                 f"Failed to get token from {url}: page stayed in not-open-yet state after "
                 f"{attempt} retries, html snippet: {snippet}..."
