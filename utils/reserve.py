@@ -6,6 +6,7 @@ import time
 import logging
 import datetime
 import os
+from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 
 # Load environment variables from .env file
@@ -104,7 +105,7 @@ class reserve:
             1, int(os.getenv("CX_TOKEN_FETCH_ATTEMPTS", "8"))
         )
         self.token_fetch_retry_delay = float(
-            os.getenv("CX_TOKEN_FETCH_RETRY_DELAY", "0.03")
+            os.getenv("CX_TOKEN_FETCH_RETRY_DELAY", "0.08")
         )
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
@@ -144,8 +145,16 @@ class reserve:
         return "已有预约" in msg or "已被占用" in msg
 
     @staticmethod
-    def _is_token_page_not_open(html: str) -> bool:
-        text = str(html or "")
+    def _is_token_page_not_open(response_url: str = "", html: str = "") -> bool:
+        parsed = urlparse(str(response_url or ""))
+        if parsed.path == "/front/apps/reserve/error/code/500":
+            msg_values = parse_qs(parsed.query).get("msg", [])
+            for value in msg_values:
+                decoded = unquote(str(value or ""))
+                if "当前区域未到开放预约时间" in decoded:
+                    return True
+
+        text = html if isinstance(html, str) else ""
         return (
             "当前区域未到开放预约时间" in text
             or "请咨询管理员确认该区域开放时间" in text
@@ -230,7 +239,7 @@ class reserve:
         not_open_retry_interval = (
             float(not_open_retry_interval)
             if not_open_retry_interval is not None
-            else 0.12
+            else self.token_fetch_retry_delay
         )
 
         while True:
@@ -253,6 +262,28 @@ class reserve:
                 logging.warning(f"Failed to fetch seat page token from {url}: {e}")
                 return "", ""
 
+            final_url = getattr(response, "url", "")
+            not_open_yet = self._is_token_page_not_open(response_url=final_url)
+            if not_open_yet and not_open_retry_until is not None:
+                now = (
+                    datetime.datetime.now(not_open_retry_until.tzinfo)
+                    if getattr(not_open_retry_until, "tzinfo", None)
+                    else datetime.datetime.now()
+                )
+                if now < not_open_retry_until:
+                    remaining_s = max(
+                        0.0, (not_open_retry_until - now).total_seconds()
+                    )
+                    sleep_s = min(not_open_retry_interval, remaining_s)
+                    logging.warning(
+                        f"Get page token from {url} redirected to not-open page on retry "
+                        f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                        f"(sleep {sleep_s:.3f}s)"
+                    )
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    continue
+
             # 统一按 UTF-8 解码，并忽略非法字符，避免 charset 识别错误导致正则匹配失败
             html = response.content.decode("utf-8", errors="ignore")
             last_html = html
@@ -274,8 +305,11 @@ class reserve:
                     )
                 return token, algorithm_value
 
-            not_open_yet = self._is_token_page_not_open(html)
-            if not_open_yet and not_open_retry_until is not None:
+            not_open_yet = self._is_token_page_not_open(
+                response_url=final_url,
+                html=html,
+            )
+            if not_open_retry_until is not None:
                 now = (
                     datetime.datetime.now(not_open_retry_until.tzinfo)
                     if getattr(not_open_retry_until, "tzinfo", None)
@@ -286,11 +320,18 @@ class reserve:
                         0.0, (not_open_retry_until - now).total_seconds()
                     )
                     sleep_s = min(not_open_retry_interval, remaining_s)
-                    logging.warning(
-                        f"Get page token from {url} hit not-open-yet page on retry "
-                        f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                        f"(sleep {sleep_s:.3f}s)"
-                    )
+                    if not_open_yet:
+                        logging.warning(
+                            f"Get page token from {url} hit not-open-yet page on retry "
+                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                            f"(sleep {sleep_s:.3f}s)"
+                        )
+                    else:
+                        logging.warning(
+                            f"Get page token from {url} returned no submit_enc on retry "
+                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                            f"(sleep {sleep_s:.3f}s)"
+                        )
                     if sleep_s > 0:
                         time.sleep(sleep_s)
                     continue
@@ -312,7 +353,7 @@ class reserve:
         # 1. 控制台打印部分页面内容
         # 2. 将完整 HTML 保存到 html_debug 目录，方便你用浏览器打开对比前端结构
         snippet = last_html[:500].replace("\n", " ")
-        if self._is_token_page_not_open(last_html):
+        if self._is_token_page_not_open(html=last_html):
             logging.error(
                 f"Failed to get token from {url}: page stayed in not-open-yet state after "
                 f"{attempt} retries, html snippet: {snippet}..."
